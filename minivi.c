@@ -22,7 +22,6 @@
 
 #define MINIVI_VERSION "0.0.1"
 #define MINIVI_TAB_STOP 8
-#define MINIVI_QUIT_TIMES 3
 
 #define CTRL_KEY(k) ((k) & 0x1f)
 
@@ -48,6 +47,13 @@ enum editorHighlight {
   HL_STRING,
   HL_NUMBER,
   HL_MATCH
+};
+
+enum editorMode {
+  EM_NORMAL = 1,
+  EM_INSERT,
+  EM_VISUAL_MODE,
+  EM_COMMAND_LINE
 };
 
 #define HL_HIGHLIGHT_NUMBERS (1<<0)
@@ -91,6 +97,11 @@ struct editorConfig {
   time_t statusmsg_time;
   struct editorSyntax *syntax;
   struct termios orig_termios;
+  int mode;
+
+  char* cmdBuf;
+  size_t cmdBuflen;
+  size_t cmdBufsize;
 };
 
 struct editorConfig E;
@@ -122,6 +133,7 @@ struct editorSyntax HLDB[] = {
 void editorSetStatusMessage(const char *fmt, ...);
 void editorRefreshScreen();
 char *editorPrompt(char *prompt, void (*callback)(char *, int));
+void editorSave(char *filename);
 
 /*** terminal ***/
 
@@ -559,6 +571,89 @@ void editorDelChar() {
   }
 }
 
+/*** editor command mode ***/
+
+void editorCommandModeStart() {
+  E.cmdBufsize = 32;
+  E.cmdBuf = malloc(E.cmdBufsize);
+  E.cmdBuf[0] = '\0';
+  E.cmdBuflen = 0;
+
+  E.mode = EM_COMMAND_LINE;
+}
+
+void editorCommandModeHandleKeypress(int c) {
+  if (E.cmdBuf == NULL) return;
+  if (iscntrl(c) || c >= 128)
+    return;
+
+  if (E.cmdBuflen == E.cmdBufsize - 1) {
+    E.cmdBufsize *= 2;
+    E.cmdBuf = realloc(E.cmdBuf, E.cmdBufsize);
+  }
+  E.cmdBuf[E.cmdBuflen++] = c;
+  E.cmdBuf[E.cmdBuflen] = '\0';
+  editorSetStatusMessage(E.cmdBuf);
+}
+
+void editorCommandModeDelChar() {
+  if (E.cmdBuf == NULL) return;
+  E.cmdBuf[--E.cmdBuflen] = '\0';
+  editorSetStatusMessage(E.cmdBuf);
+}
+
+void editorCommandModeStop() {
+  if (E.cmdBuf == NULL) return;
+  free(E.cmdBuf);
+  E.cmdBuf = NULL;
+
+  E.mode = EM_NORMAL;
+}
+
+void editorCommandModeExecute() {
+  if (E.cmdBuf == NULL) return;
+  if (E.cmdBuflen <= 1) return;
+
+  editorSetStatusMessage("");
+
+  int i = 1; // Skip ':' character at the start of a command
+  while (i < E.cmdBuflen) {
+    switch (E.cmdBuf[i]) {
+      case 'w':
+        {
+          if (i < E.cmdBuflen - 2 && E.cmdBuf[i + 1] == ' ') {
+            char *filename = malloc(E.cmdBuflen - i - 1);
+            strcpy(filename, &E.cmdBuf[i + 2]);
+            editorSave(filename);
+            free(filename);
+          } else {
+            editorSave(E.filename);
+          }
+        }
+        break;
+
+      case 'q':
+        if (E.dirty && !(i < E.cmdBuflen - 1 && E.cmdBuf[i + 1] == '!')) {
+          editorSetStatusMessage("\x1b[101mER37: No write since last change (add ! to override)\x1b[49m");
+          goto exit;
+        }
+        write(STDOUT_FILENO, "\x1b[2J", 4);
+        write(STDOUT_FILENO, "\x1b[H", 3);
+        exit(0);
+        break;
+
+      default:
+        //editorSetStatusMessage("\x1b[101mER492: Not an editor command: %s\x1b[49m", E.cmdBuf[1]);
+        goto exit;
+    }
+
+    i++;
+  }
+
+exit:
+  editorCommandModeStop();
+}
+
 /*** file i/o ***/
 
 char *editorRowsToString(int *buflen) {
@@ -587,7 +682,8 @@ void editorOpen(char *filename) {
   editorSelectSyntaxHighlight();
 
   FILE *fp = fopen(filename, "r");
-  if (!fp) die("fopen");
+  if (!fp)  // If we cannot open the file, we assume it does not exist yet.
+    return; // We have saved the name, and the file will be created on write.
 
   char *line = NULL;
   size_t linecap = 0;
@@ -604,27 +700,23 @@ void editorOpen(char *filename) {
   E.dirty = 0;
 }
 
-void editorSave() {
-  if (E.filename == NULL) {
-    E.filename = editorPrompt("Save as: %s (ESC to cancel)", NULL);
-    if (E.filename == NULL) {
-      editorSetStatusMessage("Save aborted");
-      return;
-    }
-    editorSelectSyntaxHighlight();
+void editorSave(char *filename) {
+  if (filename == NULL) {
+    editorSetStatusMessage("\x1b[101mER32: No file name\x1b[49m");
+    return;
   }
 
   int len;
   char *buf = editorRowsToString(&len);
 
-  int fd = open(E.filename, O_RDWR | O_CREAT, 0644);
+  int fd = open(filename, O_RDWR | O_CREAT, 0644);
   if (fd != -1) {
     if (ftruncate(fd, len) != -1) {
       if (write(fd, buf, len) == len) {
         close(fd);
         free(buf);
         E.dirty = 0;
-        editorSetStatusMessage("%d bytes written to disk", len);
+        editorSetStatusMessage("\"%s\" %dL, %dB written", filename, E.numrows, len);
         return;
       }
     }
@@ -906,30 +998,20 @@ void editorMoveCursor(int key) {
 
   switch (key) {
     case ARROW_LEFT:
-      if (E.cx != 0) {
+      if (E.cx != 0)
         E.cx--;
-      } else if (E.cy > 0) {
-        E.cy--;
-        E.cx = E.row[E.cy].size;
-      }
       break;
     case ARROW_RIGHT:
-      if (row && E.cx < row->size) {
+      if (row && E.cx < row->size - 1)
         E.cx++;
-      } else if (row && E.cx == row->size) { // same as E.cy == E.numrows?
-        E.cy++;
-        E.cx = 0;
-      }
       break;
     case ARROW_UP:
-      if (E.cy != 0) {
+      if (E.cy > 0)
         E.cy--;
-      }
       break;
     case ARROW_DOWN:
-      if (E.cy < E.numrows) {
+      if (E.cy < E.numrows)
         E.cy++;
-      }
       break;
   }
 
@@ -941,51 +1023,92 @@ void editorMoveCursor(int key) {
 }
 
 void editorProcessKeypress() {
-  static int quit_times = MINIVI_QUIT_TIMES;
-
   int c = editorReadKey();
 
-  switch (c) {
-    case '\r':
-      editorInsertNewline();
-      break;
+  switch (E.mode) {
+    case EM_NORMAL:
+      switch (c) {
+        case CTRL_KEY('f'):
+          editorFind();
+          break;
 
-    case CTRL_KEY('q'):
-      if (E.dirty && quit_times > 0) {
-        editorSetStatusMessage("WARNING!!! File has unsaved changes. "
-         "Press Ctrl-Q %d more times to quit.", quit_times);
-        quit_times--;
-        return;
+        case CTRL_KEY('l'):
+        case '\x1b': // escape
+          break;
+
+        case 'i':
+          E.mode = EM_INSERT;
+          editorSetStatusMessage("\033[1m-- INSERT --\033[0m");
+          break;
+
+        case ':':
+          editorCommandModeStart();
+          editorCommandModeHandleKeypress(c);
+          break;
+
+        case 'h':
+          editorMoveCursor(ARROW_LEFT);
+          break;
+
+        case 'j':
+          editorMoveCursor(ARROW_DOWN);
+          break;
+
+        case 'k':
+          editorMoveCursor(ARROW_UP);
+          break;
+
+        case 'l':
+          editorMoveCursor(ARROW_RIGHT);
+          break;
       }
-      write(STDOUT_FILENO, "\x1b[2J", 4);
-      write(STDOUT_FILENO, "\x1b[H", 3);
-      exit(0);
       break;
+    case EM_INSERT:
+      switch (c) {
+        case '\x1b': // escape
+          E.mode = EM_NORMAL;
+          editorSetStatusMessage("");
+          break;
 
-    case CTRL_KEY('s'):
-      editorSave();
+        case BACKSPACE:
+        case CTRL_KEY('h'):
+        case DEL_KEY:
+          if (c == DEL_KEY) editorMoveCursor(ARROW_RIGHT);
+          editorDelChar();
+          break;
+
+        case '\r':
+          editorInsertNewline();
+          break;
+
+        default:
+          editorInsertChar(c);
+          break;
+      }
       break;
+    case EM_COMMAND_LINE:
+      switch (c) {
+        case '\x1b': // escape
+          editorSetStatusMessage("");
+          editorCommandModeStop();
+          break;
 
-    case HOME_KEY:
-      E.cx = 0;
+        case '\r':
+          editorCommandModeExecute();
+          break;
+
+        case BACKSPACE:
+          editorCommandModeDelChar();
+          break;
+
+        default:
+          editorCommandModeHandleKeypress(c);
+          break;
+      }
       break;
+  }
 
-    case END_KEY:
-      if (E.cy < E.numrows)
-        E.cx = E.row[E.cy].size;
-      break;
-
-    case CTRL_KEY('f'):
-      editorFind();
-      break;
-
-    case BACKSPACE:
-    case CTRL_KEY('h'):
-    case DEL_KEY:
-      if (c == DEL_KEY) editorMoveCursor(ARROW_RIGHT);
-      editorDelChar();
-      break;
-
+  switch (c) { // These work regardless of editor mode
     case PAGE_UP:
     case PAGE_DOWN:
       {
@@ -1002,23 +1125,22 @@ void editorProcessKeypress() {
       }
       break;
 
+    case HOME_KEY:
+      E.cx = 0;
+      break;
+
+    case END_KEY:
+      if (E.cy < E.numrows)
+        E.cx = E.row[E.cy].size;
+      break;
+
     case ARROW_UP:
     case ARROW_DOWN:
     case ARROW_LEFT:
     case ARROW_RIGHT:
       editorMoveCursor(c);
       break;
-
-    case CTRL_KEY('l'):
-    case '\x1b': // escape
-      break;
-
-    default:
-      editorInsertChar(c);
-      break;
   }
-
-  quit_times = MINIVI_QUIT_TIMES;
 }
 
 /*** init ***/
@@ -1037,6 +1159,11 @@ void initEditor() {
   E.statusmsg[0] = '\0';
   E.statusmsg_time = 0;
   E.syntax = NULL;
+  E.mode = EM_NORMAL;
+
+  E.cmdBufsize = 0;
+  E.cmdBuflen = 0;
+  E.cmdBuf = NULL;
 
   if (getWindowSize(&E.screenrows, &E.screencols) == -1) die("getWindowSize");
   E.screenrows -= 1;
@@ -1049,8 +1176,13 @@ int main(int argc, char *argv[]) {
     editorOpen(argv[1]);
   }
 
-  editorSetStatusMessage(
-    "HELP: Ctrl-S = save | Ctrl-Q = quit | Ctrl-F = find");
+  if (E.filename != NULL) {
+    int len;
+    editorRowsToString(&len);
+    editorSetStatusMessage("\"%s\" %dL, %dB", E.filename, E.numrows, len);
+  } else {
+    editorSetStatusMessage("");
+  }
 
   while (1) {
     editorRefreshScreen();

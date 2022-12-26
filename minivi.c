@@ -1,5 +1,3 @@
-// https://viewsourcecode.org/snaptoken/kilo/01.setup.html
-
 /*** includes ***/
 
 #define _DEFAULT_SOURCE
@@ -9,6 +7,7 @@
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdarg.h>
 #include <stdlib.h>
@@ -21,9 +20,9 @@
 
 /*** defines ***/
 
-#define KILO_VERSION "0.0.1"
-#define KILO_TAB_STOP 8
-#define KILO_QUIT_TIMES 3
+#define MINIVI_VERSION "0.0.1"
+#define MINIVI_TAB_STOP 8
+#define MINIVI_QUIT_TIMES 3
 
 #define CTRL_KEY(k) ((k) & 0x1f)
 
@@ -84,6 +83,7 @@ struct editorConfig {
   int screenrows;
   int screencols;
   int numrows;
+  int lineNumbersColumnLen;
   erow *row;
   int dirty;
   char *filename;
@@ -405,7 +405,7 @@ int editorRowCxToRx(erow *row, int cx) {
   int j;
   for (j = 0; j < cx; j++) {
     if (row->chars[j] == '\t')
-      rx += (KILO_TAB_STOP - 1) - (rx % KILO_TAB_STOP);
+      rx += (MINIVI_TAB_STOP - 1) - (rx % MINIVI_TAB_STOP);
     rx++;
   }
   return rx;
@@ -416,7 +416,7 @@ int editorRowRxToCx(erow *row, int rx) {
   int cx;
   for (cx = 0; cx < row->size; cx++) {
     if (row->chars[cx] == '\t')
-      cur_rx += (KILO_TAB_STOP - 1) - (cur_rx % KILO_TAB_STOP);
+      cur_rx += (MINIVI_TAB_STOP - 1) - (cur_rx % MINIVI_TAB_STOP);
     cur_rx++;
 
     if (cur_rx > rx) return cx;
@@ -431,13 +431,13 @@ void editorUpdateRow(erow *row) {
     if (row->chars[j] == '\t') tabs++;
 
   free(row->render);
-  row->render = malloc(row->size + tabs*(KILO_TAB_STOP - 1) + 1);
+  row->render = malloc(row->size + tabs*(MINIVI_TAB_STOP - 1) + 1);
 
   int idx = 0;
   for (j = 0; j < row->size; j++) {
     if (row->chars[j] == '\t') {
       row->render[idx++] = ' ';
-      while (idx % KILO_TAB_STOP != 0) row->render[idx++] = ' ';
+      while (idx % MINIVI_TAB_STOP != 0) row->render[idx++] = ' ';
     } else {
       row->render[idx++] = row->chars[j];
     }
@@ -470,6 +470,8 @@ void editorInsertRow(int at, char *s, size_t len) {
 
   E.numrows++;
   E.dirty++;
+
+  E.lineNumbersColumnLen = E.numrows >= 1000 ? (log10(E.numrows) + 2) : 4;
 }
 
 void editorFreeRow(erow *row) {
@@ -485,6 +487,8 @@ void editorDelRow(int at) {
   for (int j = at; j < E.numrows - 1; j++) E.row[j].idx--;
   E.numrows--;
   E.dirty++;
+
+  E.lineNumbersColumnLen = E.numrows >= 1000 ? (log10(E.numrows) + 2) : 4;
 }
 
 void editorRowInsertChar(erow *row, int at, int c) {
@@ -756,7 +760,7 @@ void editorDrawRows(struct abuf *ab) {
       if (E.numrows == 0 && y == E.screenrows / 3) {
         char welcome[80];
         int welcomelen = snprintf(welcome, sizeof(welcome),
-          "Kilo editor -- version %s", KILO_VERSION);
+          "MiNiVi editor -- version %s", MINIVI_VERSION);
         if (welcomelen > E.screencols) welcomelen = E.screencols;
         int padding = (E.screencols - welcomelen) / 2;
         if (padding) {
@@ -770,13 +774,20 @@ void editorDrawRows(struct abuf *ab) {
       }
     } else {
       int len = E.row[filerow].rsize - E.coloff;
-      if (len < 0) len = 0;
-      if (len > E.screencols) len = E.screencols;
+      if (len < 0) len = E.lineNumbersColumnLen;
+      if (len > E.screencols - E.lineNumbersColumnLen) len = E.screencols - E.lineNumbersColumnLen;
       char *c = &E.row[filerow].render[E.coloff];
       unsigned char *hl = &E.row[filerow].hl[E.coloff];
+
+      char buf[64];
+      int lllen = snprintf(buf, sizeof(buf), "\x1b[33m%*d\x1b[39m ",
+        E.lineNumbersColumnLen, E.row[filerow].idx);
+      abAppend(ab, buf, lllen);
+
       int current_color = -1;
       int j;
       for (j = 0; j < len; j++) {
+        // TODO: this should be in syntax highlighting (at least not in draw rows)
         if (iscntrl(c[j])) {
           char sym = (c[j] <= 26) ? '@' + c[j] : '?';
           abAppend(ab, "\x1b[7m", 4);
@@ -812,29 +823,6 @@ void editorDrawRows(struct abuf *ab) {
   }
 }
 
-void editorDrawStatusBar(struct abuf *ab) {
-  abAppend(ab, "\x1b[7m", 4);
-  char status[80], rstatus[80];
-  int len = snprintf(status, sizeof(status), "%.20s - %d lines %s",
-    E.filename ? E.filename : "[No Name]", E.numrows,
-    E.dirty ? "(modified)" : "");
-  int rlen = snprintf(rstatus, sizeof(rstatus), "%s | %d/%d",
-    E.syntax ? E.syntax->filetype : "no ft", E.cy + 1, E.numrows);
-  if (len > E.screencols) len = E.screencols;
-  abAppend(ab, status, len);
-  while (len < E.screencols) {
-    if (E.screencols - len == rlen) {
-      abAppend(ab, rstatus, rlen);
-      break;
-     } else {
-      abAppend(ab, " ", 1);
-      len++;
-    }
-  }
-  abAppend(ab, "\x1b[m", 3);
-  abAppend(ab, "\r\n", 2);
-}
-
 void editorDrawMessageBar(struct abuf *ab) {
   abAppend(ab, "\x1b[K", 3);
   int msglen = strlen(E.statusmsg);
@@ -852,12 +840,11 @@ void editorRefreshScreen() {
   abAppend(&ab, "\x1b[H", 3);
 
   editorDrawRows(&ab);
-  editorDrawStatusBar(&ab);
   editorDrawMessageBar(&ab);
 
   char buf[32];
-  snprintf(buf, sizeof(buf), "\x1b[%d;%dH", (E.cy - E.rowoff) + 1,
-                                            (E.rx - E.coloff) + 1);
+  snprintf(buf, sizeof(buf), "\x1b[%d;%dH", // position cursor
+    (E.cy - E.rowoff) + 1, (E.rx - E.coloff + E.lineNumbersColumnLen + 1) + 1);
   abAppend(&ab, buf, strlen(buf));
 
   abAppend(&ab, "\x1b[?25h", 6);
@@ -954,7 +941,7 @@ void editorMoveCursor(int key) {
 }
 
 void editorProcessKeypress() {
-  static int quit_times = KILO_QUIT_TIMES;
+  static int quit_times = MINIVI_QUIT_TIMES;
 
   int c = editorReadKey();
 
@@ -1031,7 +1018,7 @@ void editorProcessKeypress() {
       break;
   }
 
-  quit_times = KILO_QUIT_TIMES;
+  quit_times = MINIVI_QUIT_TIMES;
 }
 
 /*** init ***/
@@ -1043,6 +1030,7 @@ void initEditor() {
   E.rowoff = 0;
   E.coloff = 0;
   E.numrows = 0;
+  E.lineNumbersColumnLen = 4;
   E.row = NULL;
   E.dirty = 0;
   E.filename = NULL;
@@ -1051,7 +1039,7 @@ void initEditor() {
   E.syntax = NULL;
 
   if (getWindowSize(&E.screenrows, &E.screencols) == -1) die("getWindowSize");
-  E.screenrows -= 2;
+  E.screenrows -= 1;
 }
 
 int main(int argc, char *argv[]) {
